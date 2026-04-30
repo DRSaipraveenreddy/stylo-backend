@@ -179,6 +179,15 @@ Use this exact format:
     except Exception as e:
         print(f"Outfit generation error: {e}")
         return {"error": str(e)}
+    
+@app.delete("/wardrobe/{user_id}/{item_id}")
+async def delete_item(user_id: str, item_id: str):
+    try:
+        supabase.table("clothing_items").delete().eq("id", item_id).eq("user_id", user_id).execute()
+        return {"status": "success", "message": "Item deleted"}
+    except Exception as e:
+        print(f"Delete error: {e}")
+        return {"error": str(e)} 
 
 # ── RUN SERVER ────────────────────────────────────────────────
 if __name__ == "__main__":
