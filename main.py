@@ -5,11 +5,11 @@ from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 import os
 import re
 import uuid
 import json
-import base64
 
 load_dotenv()
 
@@ -89,16 +89,9 @@ async def scan_outfit(
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ):
-    """
-    User uploads a full outfit photo.
-    Gemini detects all clothing items and sorts them into:
-    Tops, Bottoms, Footwear, Accessories
-    Each item is saved separately to the wardrobe in Supabase.
-    """
     try:
-        # Step 1 — Read image and convert to base64
+        # Step 1 — Read image bytes directly (no base64 needed)
         contents = await file.read()
-        base64_image = base64.b64encode(contents).decode("utf-8")
         mime_type = file.content_type or "image/jpeg"
 
         # Step 2 — Upload original outfit photo to Supabase Storage
@@ -140,22 +133,15 @@ Rules:
 - Only include items clearly visible in the photo
 - Return JSON only, absolutely no extra text"""
 
+        # ✅ FIXED — correct format for google-genai Python SDK
         ai_response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
-                {
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": base64_image
-                            }
-                        },
-                        {
-                            "text": prompt
-                        }
-                    ]
-                }
+                types.Part.from_bytes(
+                    data=contents,
+                    mime_type=mime_type
+                ),
+                prompt
             ]
         )
 
@@ -196,11 +182,11 @@ Rules:
 
                 item_data = {
                     "user_id": user_id,
-                    "image_url": outfit_photo_url,  # Links back to outfit photo
+                    "image_url": outfit_photo_url,
                     "filename": clean_name,
                     "item_name": full_name,
                     "category": category_label,
-                    "style_tag": style,             # Optional: store style tag
+                    "style_tag": style,
                 }
 
                 supabase.table("clothing_items").insert(item_data).execute()
@@ -214,8 +200,8 @@ Rules:
             "status": "success",
             "message": f"{len(saved_items)} items detected and saved to your wardrobe!",
             "outfit_photo_url": outfit_photo_url,
-            "detected_items": detected_items,   # Full breakdown by category
-            "saved_items": saved_items           # Flat list of what was saved
+            "detected_items": detected_items,
+            "saved_items": saved_items
         }
 
     except json.JSONDecodeError:
@@ -241,10 +227,6 @@ def get_wardrobe(user_id: str):
 # ── GET WARDROBE BY CATEGORY ──────────────────────────────────
 @app.get("/wardrobe/{user_id}/category/{category}")
 def get_wardrobe_by_category(user_id: str, category: str):
-    """
-    Fetch wardrobe items filtered by category.
-    Categories: Tops, Bottoms, Footwear, Accessories, General
-    """
     try:
         response = (
             supabase.table("clothing_items")
