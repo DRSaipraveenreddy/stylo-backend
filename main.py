@@ -35,7 +35,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Initialize Gemini
 ai_client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options={'api_version': 'v1'}
+    http_options={'api_version': 'v1beta'}
 )
 
 # ── HEALTH CHECK ──────────────────────────────────────────────
@@ -135,7 +135,7 @@ Rules:
 
         # ✅ FIXED — correct format for google-genai Python SDK
         ai_response = ai_client.models.generate_content(
-            model='models/gemini-1.5-flash',
+            model='gemini-1.5-flash',
             contents=[
                 types.Part.from_bytes(
                     data=contents,
@@ -304,7 +304,7 @@ Use this exact format:
 
         # Step 4 — call Gemini
         ai_response = ai_client.models.generate_content(
-            model='models/gemini-1.5-flash',
+            model='gemini-1.5-flash',
             contents=prompt
         )
 
