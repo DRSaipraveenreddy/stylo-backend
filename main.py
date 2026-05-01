@@ -8,6 +8,8 @@ from google import genai
 import os
 import re
 import uuid
+import json
+import base64
 
 load_dotenv()
 
@@ -47,7 +49,7 @@ async def upload_image(
     file: UploadFile = File(...),
     user_id: str = Form(...),
     category: str = Form(None),
-    item_name: str = Form(None),    # optional for now
+    item_name: str = Form(None),
 ):
     try:
         contents = await file.read()
@@ -80,6 +82,151 @@ async def upload_image(
         print(f"Upload error: {e}")
         return {"error": str(e)}
 
+
+# ── SCAN OUTFIT PHOTO & AUTO-SORT INTO WARDROBE ───────────────
+@app.post("/scan-outfit")
+async def scan_outfit(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+):
+    """
+    User uploads a full outfit photo.
+    Gemini detects all clothing items and sorts them into:
+    Tops, Bottoms, Footwear, Accessories
+    Each item is saved separately to the wardrobe in Supabase.
+    """
+    try:
+        # Step 1 — Read image and convert to base64
+        contents = await file.read()
+        base64_image = base64.b64encode(contents).decode("utf-8")
+        mime_type = file.content_type or "image/jpeg"
+
+        # Step 2 — Upload original outfit photo to Supabase Storage
+        clean_name = re.sub(r'[^a-zA-Z0-9.-]', '_', file.filename)
+        file_path = f"{user_id}/outfits/{uuid.uuid4()}_{clean_name}"
+
+        supabase.storage.from_("clothing-images").upload(
+            path=file_path,
+            file=contents,
+            file_options={"content-type": mime_type, "x-upsert": "true"}
+        )
+        outfit_photo_url = supabase.storage.from_("clothing-images").get_public_url(file_path)
+
+        # Step 3 — Send image to Gemini for analysis
+        prompt = """You are a professional fashion stylist analyzing an outfit photo.
+
+Identify every visible clothing item in this photo and categorize them.
+
+Return ONLY a valid JSON object with no extra text, no markdown, no code blocks.
+Use this exact format:
+{
+  "tops": [
+    {"name": "White oversized t-shirt", "color": "white", "style": "casual"}
+  ],
+  "bottoms": [
+    {"name": "Black slim fit jeans", "color": "black", "style": "casual"}
+  ],
+  "footwear": [
+    {"name": "White Nike Air Force 1", "color": "white", "style": "sneakers"}
+  ],
+  "accessories": [
+    {"name": "Silver chain necklace", "color": "silver", "style": "minimal"}
+  ]
+}
+
+Rules:
+- If a category has no items, return an empty array []
+- Be specific about color, fit, and style for each item
+- Only include items clearly visible in the photo
+- Return JSON only, absolutely no extra text"""
+
+        ai_response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                {
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": base64_image
+                            }
+                        },
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
+        )
+
+        # Step 4 — Parse Gemini response
+        raw_text = ai_response.text.strip()
+
+        # Clean markdown if Gemini adds it
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
+
+        detected_items = json.loads(raw_text)
+
+        # Step 5 — Save each detected item to Supabase wardrobe
+        saved_items = []
+        category_map = {
+            "tops": "Tops",
+            "bottoms": "Bottoms",
+            "footwear": "Footwear",
+            "accessories": "Accessories"
+        }
+
+        for category_key, category_label in category_map.items():
+            items_in_category = detected_items.get(category_key, [])
+            for item in items_in_category:
+                item_name = item.get("name", "Unknown item")
+                color = item.get("color", "")
+                style = item.get("style", "")
+
+                # Full description as item name
+                full_name = f"{item_name}"
+                if color and color.lower() not in item_name.lower():
+                    full_name = f"{color.capitalize()} {item_name}"
+
+                item_data = {
+                    "user_id": user_id,
+                    "image_url": outfit_photo_url,  # Links back to outfit photo
+                    "filename": clean_name,
+                    "item_name": full_name,
+                    "category": category_label,
+                    "style_tag": style,             # Optional: store style tag
+                }
+
+                supabase.table("clothing_items").insert(item_data).execute()
+                saved_items.append({
+                    "category": category_label,
+                    "item_name": full_name
+                })
+
+        # Step 6 — Return summary
+        return {
+            "status": "success",
+            "message": f"{len(saved_items)} items detected and saved to your wardrobe!",
+            "outfit_photo_url": outfit_photo_url,
+            "detected_items": detected_items,   # Full breakdown by category
+            "saved_items": saved_items           # Flat list of what was saved
+        }
+
+    except json.JSONDecodeError:
+        print(f"Gemini returned invalid JSON: {raw_text}")
+        return {"error": "AI could not analyze the photo. Please try a clearer image."}
+
+    except Exception as e:
+        print(f"Scan outfit error: {e}")
+        return {"error": str(e)}
+
+
 # ── GET WARDROBE ──────────────────────────────────────────────
 @app.get("/wardrobe/{user_id}")
 def get_wardrobe(user_id: str):
@@ -90,10 +237,33 @@ def get_wardrobe(user_id: str):
         print(f"Wardrobe error: {e}")
         return {"error": str(e)}
 
+
+# ── GET WARDROBE BY CATEGORY ──────────────────────────────────
+@app.get("/wardrobe/{user_id}/category/{category}")
+def get_wardrobe_by_category(user_id: str, category: str):
+    """
+    Fetch wardrobe items filtered by category.
+    Categories: Tops, Bottoms, Footwear, Accessories, General
+    """
+    try:
+        response = (
+            supabase.table("clothing_items")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("category", category)
+            .execute()
+        )
+        return {"category": category, "items": response.data}
+    except Exception as e:
+        print(f"Wardrobe category error: {e}")
+        return {"error": str(e)}
+
+
 # ── OUTFITS REQUEST BODY ──────────────────────────────────────
 class OutfitRequest(BaseModel):
     user_id: str
     preferences: Optional[dict] = None
+
 
 # ── GENERATE OUTFITS ──────────────────────────────────────────
 @app.post("/outfits")
@@ -111,13 +281,13 @@ async def generate_outfits(request: OutfitRequest):
         # Step 2 — build items list
         items = response.data
         item_descriptions = [
-             f"{item.get('item_name') or item.get('filename', 'item')} ({item.get('category', 'General')})"
+            f"{item.get('item_name') or item.get('filename', 'item')} ({item.get('category', 'General')})"
             for item in items
         ]
         image_map = {
-     item.get('item_name') or item.get('filename', ''): item.get('image_url', '')
-    for item in items
-    }
+            item.get('item_name') or item.get('filename', ''): item.get('image_url', '')
+            for item in items
+        }
         wardrobe_str = "\n".join(item_descriptions)
 
         # Step 3 — build prompt with preferences
@@ -158,7 +328,7 @@ Use this exact format:
 
         raw_text = ai_response.text.strip()
 
-        # Step 5 — clean response (remove markdown if Gemini adds it)
+        # Step 5 — clean response
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -167,10 +337,9 @@ Use this exact format:
             raw_text = raw_text[:-3]
         raw_text = raw_text.strip()
 
-        import json
         outfits = json.loads(raw_text)
 
-        return {"status": "success", "outfits": outfits,  "image_map": image_map}
+        return {"status": "success", "outfits": outfits, "image_map": image_map}
 
     except json.JSONDecodeError:
         print(f"Gemini returned invalid JSON: {raw_text}")
@@ -179,7 +348,9 @@ Use this exact format:
     except Exception as e:
         print(f"Outfit generation error: {e}")
         return {"error": str(e)}
-    
+
+
+# ── DELETE WARDROBE ITEM ──────────────────────────────────────
 @app.delete("/wardrobe/{user_id}/{item_id}")
 async def delete_item(user_id: str, item_id: str):
     try:
@@ -187,7 +358,8 @@ async def delete_item(user_id: str, item_id: str):
         return {"status": "success", "message": "Item deleted"}
     except Exception as e:
         print(f"Delete error: {e}")
-        return {"error": str(e)} 
+        return {"error": str(e)}
+
 
 # ── RUN SERVER ────────────────────────────────────────────────
 if __name__ == "__main__":
