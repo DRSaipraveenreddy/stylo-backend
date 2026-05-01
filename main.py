@@ -135,7 +135,7 @@ Rules:
 
         # ✅ FIXED — correct format for google-genai Python SDK
         ai_response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-1.5-flash',
             contents=[
                 types.Part.from_bytes(
                     data=contents,
@@ -304,7 +304,7 @@ Use this exact format:
 
         # Step 4 — call Gemini
         ai_response = ai_client.models.generate_content(
-            model='gemini-2.5-flash-lite',
+            model='gemini-1.5-flash',
             contents=prompt
         )
 
