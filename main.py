@@ -11,7 +11,6 @@ import os
 import re
 import uuid
 import json
-import base64
 import io
 import httpx
 
@@ -96,45 +95,77 @@ def crop_item_from_image(image_bytes: bytes, bbox: list, padding: int = 20) -> b
 
         x_pct, y_pct, w_pct, h_pct = bbox
 
-        # Convert percentages to pixels
         x1 = int((x_pct / 100) * img_width) - padding
         y1 = int((y_pct / 100) * img_height) - padding
         x2 = int(((x_pct + w_pct) / 100) * img_width) + padding
         y2 = int(((y_pct + h_pct) / 100) * img_height) + padding
 
-        # Clamp to image boundaries
+        # ✅ If item takes more than 60% height (dress/jumpsuit), use full height
+        if h_pct > 60:
+            y1 = 0
+            y2 = img_height
+
         x1 = max(0, x1)
         y1 = max(0, y1)
         x2 = min(img_width, x2)
         y2 = min(img_height, y2)
 
         cropped = img.crop((x1, y1, x2, y2))
-
         output = io.BytesIO()
         cropped.save(output, format="PNG")
         return output.getvalue()
 
     except Exception as e:
         print(f"Crop error: {e}")
-        return image_bytes  # fallback to original
+        return image_bytes
+
+
+# ── HELPER: Find best matching image URL ──────────────────────
+def find_image_url(item_name: str, image_map: dict) -> str | None:
+    """
+    Finds the best matching image URL for an item name.
+    Tries exact match first, then partial match as fallback.
+    """
+    item_lower = item_name.lower().strip()
+
+    # 1. Exact match
+    for key, url in image_map.items():
+        if key.lower().strip() == item_lower:
+            return url
+
+    # 2. One contains the other
+    for key, url in image_map.items():
+        key_lower = key.lower().strip()
+        if item_lower in key_lower or key_lower in item_lower:
+            return url
+
+    # 3. Word overlap (at least 2 words match)
+    item_words = set(item_lower.split())
+    best_match_url = None
+    best_match_count = 0
+    for key, url in image_map.items():
+        key_words = set(key.lower().split())
+        overlap = len(item_words & key_words)
+        if overlap >= 2 and overlap > best_match_count:
+            best_match_count = overlap
+            best_match_url = url
+
+    return best_match_url
 
 
 # ── HELPER: Build outfit collage from image URLs ──────────────
-async def build_outfit_collage(image_urls: list, outfit_name: str) -> bytes:
+async def build_outfit_collage(image_urls: list, outfit_name: str) -> bytes | None:
     """
     Downloads wardrobe item images and stitches them into
     a clean outfit collage card using Pillow.
     """
     try:
-        CARD_WIDTH = 900
-        ITEM_SIZE = 280       # each item thumbnail size
+        ITEM_SIZE = 280
         PADDING = 20
         HEADER_HEIGHT = 60
-        LABEL_HEIGHT = 40
 
         images = []
 
-        # Download each item image
         async with httpx.AsyncClient() as client:
             for url in image_urls:
                 try:
@@ -147,6 +178,7 @@ async def build_outfit_collage(image_urls: list, outfit_name: str) -> bytes:
                     print(f"Image download error: {e}")
 
         if not images:
+            print("No images downloaded for collage")
             return None
 
         num_items = len(images)
@@ -154,46 +186,39 @@ async def build_outfit_collage(image_urls: list, outfit_name: str) -> bytes:
         rows = (num_items + cols - 1) // cols
 
         canvas_width = cols * (ITEM_SIZE + PADDING) + PADDING
-        canvas_height = HEADER_HEIGHT + rows * (ITEM_SIZE + LABEL_HEIGHT + PADDING) + PADDING
+        canvas_height = HEADER_HEIGHT + rows * (ITEM_SIZE + PADDING) + PADDING
 
-        # White canvas
         canvas = Image.new("RGBA", (canvas_width, canvas_height), (255, 255, 255, 255))
         draw = ImageDraw.Draw(canvas)
 
-        # Header — outfit name
+        # Header
         draw.rectangle([0, 0, canvas_width, HEADER_HEIGHT], fill=(0, 0, 0, 255))
         try:
             font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-            font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
         except:
             font_header = ImageFont.load_default()
-            font_label = ImageFont.load_default()
 
         draw.text((PADDING, 18), outfit_name, fill=(255, 255, 255), font=font_header)
 
-        # Place each item image on canvas
+        # Place items
         for i, img in enumerate(images):
             col = i % cols
             row = i // cols
 
             x = PADDING + col * (ITEM_SIZE + PADDING)
-            y = HEADER_HEIGHT + PADDING + row * (ITEM_SIZE + LABEL_HEIGHT + PADDING)
+            y = HEADER_HEIGHT + PADDING + row * (ITEM_SIZE + PADDING)
 
-            # White card background per item
             draw.rounded_rectangle(
-                [x - 4, y - 4, x + ITEM_SIZE + 4, y + ITEM_SIZE + LABEL_HEIGHT + 4],
+                [x - 4, y - 4, x + ITEM_SIZE + 4, y + ITEM_SIZE + 4],
                 radius=12,
                 fill=(245, 245, 245, 255)
             )
 
-            # Center image in its cell
             img_w, img_h = img.size
             offset_x = x + (ITEM_SIZE - img_w) // 2
             offset_y = y + (ITEM_SIZE - img_h) // 2
-
             canvas.paste(img, (offset_x, offset_y), img)
 
-        # Convert to bytes
         output = io.BytesIO()
         canvas.convert("RGB").save(output, format="JPEG", quality=90)
         return output.getvalue()
@@ -209,19 +234,12 @@ async def scan_outfit(
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ):
-    """
-    User uploads a full outfit photo.
-    Gemini detects items + bounding boxes.
-    Pillow crops each item individually.
-    Each cropped item saved to correct wardrobe category.
-    """
     try:
-        # Step 1 — Read image bytes
         contents = await file.read()
         mime_type = file.content_type or "image/jpeg"
         clean_name = re.sub(r'[^a-zA-Z0-9.-]', '_', file.filename)
 
-        # Step 2 — Send to Gemini for detection + bounding boxes
+        # ✅ Updated prompt — now includes dresses category
         prompt = """You are a professional fashion stylist analyzing an outfit photo.
 
 Detect every visible clothing item and return their exact locations as bounding boxes.
@@ -245,6 +263,14 @@ Use this exact format:
       "bbox": [15, 45, 70, 50]
     }
   ],
+  "dresses": [
+    {
+      "name": "Maroon halter neck mini dress",
+      "color": "maroon",
+      "style": "elegant",
+      "bbox": [10, 5, 80, 90]
+    }
+  ],
   "footwear": [
     {
       "name": "White sneakers",
@@ -253,7 +279,14 @@ Use this exact format:
       "bbox": [20, 85, 60, 12]
     }
   ],
-  "accessories": []
+  "accessories": [
+    {
+      "name": "Gold pendant necklace",
+      "color": "gold",
+      "style": "minimal",
+      "bbox": [35, 10, 30, 15]
+    }
+  ]
 }
 
 bbox format: [x, y, width, height] as PERCENTAGES of image size (0 to 100).
@@ -261,11 +294,11 @@ x, y = top-left corner of the item
 width, height = size of the item
 
 Rules:
-- Return accurate bounding boxes that tightly fit each clothing item
+- If an item is a full one-piece garment (dress, jumpsuit, romper), put it in "dresses" NOT tops or bottoms
 - If a category has no items, return empty array []
+- Return accurate bounding boxes that tightly fit each clothing item
 - Return JSON only, no extra text"""
 
-        # ✅ Gemini image analysis with bounding boxes
         ai_response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
@@ -277,7 +310,6 @@ Rules:
             ]
         )
 
-        # Step 3 — Parse response
         raw_text = ai_response.text.strip()
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
@@ -289,11 +321,13 @@ Rules:
 
         detected_items = json.loads(raw_text)
 
-        # Step 4 — Crop each item and save to Supabase
         saved_items = []
+
+        # ✅ Updated category map — now includes Dresses
         category_map = {
             "tops": "Tops",
             "bottoms": "Bottoms",
+            "dresses": "Dresses",
             "footwear": "Footwear",
             "accessories": "Accessories"
         }
@@ -310,17 +344,23 @@ Rules:
                 if color and color.lower() not in item_name.lower():
                     full_name = f"{color.capitalize()} {item_name}"
 
-                # ✅ Crop using Pillow if bbox available
-                if bbox and len(bbox) == 4:
+                # ✅ Smart crop logic per category
+                if category_label == "Accessories":
+                    # Accessories are too small — bbox always wrong, use full image
+                    item_image_bytes = contents
+                    image_ext = "jpg"
+                    content_type = "image/jpeg"
+                elif bbox and len(bbox) == 4:
+                    # Crop using bbox for all other categories
                     item_image_bytes = crop_item_from_image(contents, bbox)
                     image_ext = "png"
                     content_type = "image/png"
                 else:
+                    # No bbox fallback
                     item_image_bytes = contents
                     image_ext = "jpg"
                     content_type = "image/jpeg"
 
-                # Upload cropped image
                 item_file_path = f"{user_id}/{category_label.lower()}/{uuid.uuid4()}.{image_ext}"
                 supabase.storage.from_("clothing-images").upload(
                     path=item_file_path,
@@ -329,7 +369,6 @@ Rules:
                 )
                 item_image_url = supabase.storage.from_("clothing-images").get_public_url(item_file_path)
 
-                # Save to DB
                 item_data = {
                     "user_id": user_id,
                     "image_url": item_image_url,
@@ -399,7 +438,6 @@ class OutfitRequest(BaseModel):
 @app.post("/outfits")
 async def generate_outfits(request: OutfitRequest):
     try:
-        # Step 1 — fetch wardrobe
         response = supabase.table("clothing_items").select("*").eq("user_id", request.user_id).execute()
 
         if not response.data or len(response.data) == 0:
@@ -433,22 +471,26 @@ The user's style profile:
 - Body type: {', '.join(body_type) if body_type else 'not specified'}
 - Occasions they dress for: {', '.join(occasions) if occasions else 'not specified'}
 
-Their wardrobe contains:
+Their wardrobe contains ONLY these items (use EXACT names as listed):
 {wardrobe_str}
 
-Suggest 5 outfit combinations using ONLY items from their wardrobe.
+CRITICAL RULES:
+1. Use ONLY items listed above — do NOT invent or add items not in the list
+2. Use the EXACT item name as written above — do not rename, shorten or modify
+3. Each outfit must have at least a top and bottom OR a dress
+4. Suggest 5 outfit combinations
+
 Return ONLY a valid JSON array with no extra text, no markdown, no code blocks.
 Use this exact format:
 [
   {{
     "outfit_name": "Casual Friday",
-    "items": ["item1", "item2", "item3"],
+    "items": ["exact item name 1", "exact item name 2"],
     "styling_tip": "A short styling tip",
     "occasion": "Casual"
   }}
 ]"""
 
-        # Step 2 — Gemini generates outfit suggestions
         ai_response = ai_client.models.generate_content(
             model='gemini-2.5-flash-lite',
             contents=prompt
@@ -465,27 +507,22 @@ Use this exact format:
 
         outfits = json.loads(raw_text)
 
-        # Step 3 — ✅ Build collage for each outfit using Pillow
+        # Build collage for each outfit
         for outfit in outfits:
             outfit_items = outfit.get("items", [])
             outfit_name = outfit.get("outfit_name", "Outfit")
 
-            # Get image URLs for items in this outfit
             item_image_urls = []
             for item_name in outfit_items:
-                # Fuzzy match item name to wardrobe
-                for wardrobe_key, url in image_map.items():
-                    if any(word.lower() in wardrobe_key.lower() for word in item_name.split()):
-                        if url and url not in item_image_urls:
-                            item_image_urls.append(url)
-                        break
+                url = find_image_url(item_name, image_map)
+                if url and url not in item_image_urls:
+                    item_image_urls.append(url)
+
+            print(f"Outfit: {outfit_name} | items: {outfit_items} | urls found: {len(item_image_urls)}")
 
             if item_image_urls:
-                # Build collage using Pillow
                 collage_bytes = await build_outfit_collage(item_image_urls, outfit_name)
-
                 if collage_bytes:
-                    # Upload collage to Supabase
                     collage_path = f"{request.user_id}/collages/{uuid.uuid4()}.jpg"
                     supabase.storage.from_("clothing-images").upload(
                         path=collage_path,
@@ -493,7 +530,7 @@ Use this exact format:
                         file_options={"content-type": "image/jpeg", "x-upsert": "true"}
                     )
                     collage_url = supabase.storage.from_("clothing-images").get_public_url(collage_path)
-                    outfit["collage_url"] = collage_url  # ✅ attach collage URL to outfit
+                    outfit["collage_url"] = collage_url
                 else:
                     outfit["collage_url"] = None
             else:
