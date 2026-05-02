@@ -279,14 +279,7 @@ Use this exact format:
       "bbox": [20, 85, 60, 12]
     }
   ],
-  "accessories": [
-    {
-      "name": "Gold pendant necklace",
-      "color": "gold",
-      "style": "minimal",
-      "bbox": [35, 10, 30, 15]
-    }
-  ]
+  
 }
 
 bbox format: [x, y, width, height] as PERCENTAGES of image size (0 to 100).
@@ -328,8 +321,8 @@ Rules:
             "tops": "Tops",
             "bottoms": "Bottoms",
             "dresses": "Dresses",
-            "footwear": "Footwear",
-            "accessories": "Accessories"
+            "footwear": "Footwear"
+            
         }
 
         for category_key, category_label in category_map.items():
@@ -479,6 +472,7 @@ CRITICAL RULES:
 2. Use the EXACT item name as written above — do not rename, shorten or modify
 3. Each outfit must have at least a top and bottom OR a dress
 4. Suggest 5 outfit combinations
+5. Do NOT detect or return accessories — ignore all jewelry, bags, belts
 
 Return ONLY a valid JSON array with no extra text, no markdown, no code blocks.
 Use this exact format:
