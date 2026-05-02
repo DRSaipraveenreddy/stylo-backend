@@ -6,16 +6,20 @@ from typing import Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from PIL import Image, ImageDraw, ImageFont
 import os
 import re
 import uuid
 import json
+import base64
+import io
+import httpx
 
 load_dotenv()
 
 app = FastAPI()
 
-# CORS — allows frontend to talk to backend
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,21 +28,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Credentials from .env
+# Credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize Supabase
+# Initialize clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+ai_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options={'api_version': 'v1'}
+)
 
-# Initialize Gemini
-ai_client = genai.Client(api_key=GEMINI_API_KEY) 
 
 # ── HEALTH CHECK ──────────────────────────────────────────────
 @app.get("/hello")
 def hello():
     return {"message": "Backend is working!"}
+
 
 # ── UPLOAD IMAGE ──────────────────────────────────────────────
 @app.post("/upload")
@@ -53,17 +60,14 @@ async def upload_image(
         clean_name = re.sub(r'[^a-zA-Z0-9.-]', '_', file.filename)
         file_path = f"{user_id}/{uuid.uuid4()}_{clean_name}"
 
-        # Upload to Supabase Storage
         supabase.storage.from_("clothing-images").upload(
             path=file_path,
             file=contents,
             file_options={"content-type": file.content_type, "x-upsert": "true"}
         )
 
-        # Get public URL
         public_url = supabase.storage.from_("clothing-images").get_public_url(file_path)
 
-        # Save to clothing_items table
         item_data = {
             "user_id": user_id,
             "image_url": public_url,
@@ -80,59 +84,190 @@ async def upload_image(
         return {"error": str(e)}
 
 
+# ── HELPER: Crop item from image using bounding box ───────────
+def crop_item_from_image(image_bytes: bytes, bbox: list, padding: int = 20) -> bytes:
+    """
+    Crops a clothing item from the full image using bounding box.
+    bbox format: [x, y, width, height] as percentages (0-100)
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        img_width, img_height = img.size
+
+        x_pct, y_pct, w_pct, h_pct = bbox
+
+        # Convert percentages to pixels
+        x1 = int((x_pct / 100) * img_width) - padding
+        y1 = int((y_pct / 100) * img_height) - padding
+        x2 = int(((x_pct + w_pct) / 100) * img_width) + padding
+        y2 = int(((y_pct + h_pct) / 100) * img_height) + padding
+
+        # Clamp to image boundaries
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(img_width, x2)
+        y2 = min(img_height, y2)
+
+        cropped = img.crop((x1, y1, x2, y2))
+
+        output = io.BytesIO()
+        cropped.save(output, format="PNG")
+        return output.getvalue()
+
+    except Exception as e:
+        print(f"Crop error: {e}")
+        return image_bytes  # fallback to original
+
+
+# ── HELPER: Build outfit collage from image URLs ──────────────
+async def build_outfit_collage(image_urls: list, outfit_name: str) -> bytes:
+    """
+    Downloads wardrobe item images and stitches them into
+    a clean outfit collage card using Pillow.
+    """
+    try:
+        CARD_WIDTH = 900
+        ITEM_SIZE = 280       # each item thumbnail size
+        PADDING = 20
+        HEADER_HEIGHT = 60
+        LABEL_HEIGHT = 40
+
+        images = []
+
+        # Download each item image
+        async with httpx.AsyncClient() as client:
+            for url in image_urls:
+                try:
+                    resp = await client.get(url, timeout=10)
+                    if resp.status_code == 200:
+                        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                        img.thumbnail((ITEM_SIZE, ITEM_SIZE), Image.LANCZOS)
+                        images.append(img)
+                except Exception as e:
+                    print(f"Image download error: {e}")
+
+        if not images:
+            return None
+
+        num_items = len(images)
+        cols = min(num_items, 3)
+        rows = (num_items + cols - 1) // cols
+
+        canvas_width = cols * (ITEM_SIZE + PADDING) + PADDING
+        canvas_height = HEADER_HEIGHT + rows * (ITEM_SIZE + LABEL_HEIGHT + PADDING) + PADDING
+
+        # White canvas
+        canvas = Image.new("RGBA", (canvas_width, canvas_height), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        # Header — outfit name
+        draw.rectangle([0, 0, canvas_width, HEADER_HEIGHT], fill=(0, 0, 0, 255))
+        try:
+            font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+            font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        except:
+            font_header = ImageFont.load_default()
+            font_label = ImageFont.load_default()
+
+        draw.text((PADDING, 18), outfit_name, fill=(255, 255, 255), font=font_header)
+
+        # Place each item image on canvas
+        for i, img in enumerate(images):
+            col = i % cols
+            row = i // cols
+
+            x = PADDING + col * (ITEM_SIZE + PADDING)
+            y = HEADER_HEIGHT + PADDING + row * (ITEM_SIZE + LABEL_HEIGHT + PADDING)
+
+            # White card background per item
+            draw.rounded_rectangle(
+                [x - 4, y - 4, x + ITEM_SIZE + 4, y + ITEM_SIZE + LABEL_HEIGHT + 4],
+                radius=12,
+                fill=(245, 245, 245, 255)
+            )
+
+            # Center image in its cell
+            img_w, img_h = img.size
+            offset_x = x + (ITEM_SIZE - img_w) // 2
+            offset_y = y + (ITEM_SIZE - img_h) // 2
+
+            canvas.paste(img, (offset_x, offset_y), img)
+
+        # Convert to bytes
+        output = io.BytesIO()
+        canvas.convert("RGB").save(output, format="JPEG", quality=90)
+        return output.getvalue()
+
+    except Exception as e:
+        print(f"Collage build error: {e}")
+        return None
+
+
 # ── SCAN OUTFIT PHOTO & AUTO-SORT INTO WARDROBE ───────────────
 @app.post("/scan-outfit")
 async def scan_outfit(
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ):
+    """
+    User uploads a full outfit photo.
+    Gemini detects items + bounding boxes.
+    Pillow crops each item individually.
+    Each cropped item saved to correct wardrobe category.
+    """
     try:
-        # Step 1 — Read image bytes directly (no base64 needed)
+        # Step 1 — Read image bytes
         contents = await file.read()
         mime_type = file.content_type or "image/jpeg"
-
-        # Step 2 — Upload original outfit photo to Supabase Storage
         clean_name = re.sub(r'[^a-zA-Z0-9.-]', '_', file.filename)
-        file_path = f"{user_id}/outfits/{uuid.uuid4()}_{clean_name}"
 
-        supabase.storage.from_("clothing-images").upload(
-            path=file_path,
-            file=contents,
-            file_options={"content-type": mime_type, "x-upsert": "true"}
-        )
-        outfit_photo_url = supabase.storage.from_("clothing-images").get_public_url(file_path)
-
-        # Step 3 — Send image to Gemini for analysis
+        # Step 2 — Send to Gemini for detection + bounding boxes
         prompt = """You are a professional fashion stylist analyzing an outfit photo.
 
-Identify every visible clothing item in this photo and categorize them.
+Detect every visible clothing item and return their exact locations as bounding boxes.
 
-Return ONLY a valid JSON object with no extra text, no markdown, no code blocks.
+Return ONLY a valid JSON object. No markdown, no extra text.
 Use this exact format:
 {
   "tops": [
-    {"name": "White oversized t-shirt", "color": "white", "style": "casual"}
+    {
+      "name": "White oversized t-shirt",
+      "color": "white",
+      "style": "casual",
+      "bbox": [10, 5, 80, 40]
+    }
   ],
   "bottoms": [
-    {"name": "Black slim fit jeans", "color": "black", "style": "casual"}
+    {
+      "name": "Black slim fit jeans",
+      "color": "black",
+      "style": "casual",
+      "bbox": [15, 45, 70, 50]
+    }
   ],
   "footwear": [
-    {"name": "White Nike Air Force 1", "color": "white", "style": "sneakers"}
+    {
+      "name": "White sneakers",
+      "color": "white",
+      "style": "casual",
+      "bbox": [20, 85, 60, 12]
+    }
   ],
-  "accessories": [
-    {"name": "Silver chain necklace", "color": "silver", "style": "minimal"}
-  ]
+  "accessories": []
 }
 
-Rules:
-- If a category has no items, return an empty array []
-- Be specific about color, fit, and style for each item
-- Only include items clearly visible in the photo
-- Return JSON only, absolutely no extra text"""
+bbox format: [x, y, width, height] as PERCENTAGES of image size (0 to 100).
+x, y = top-left corner of the item
+width, height = size of the item
 
-        # ✅ FIXED — correct format for google-genai Python SDK
+Rules:
+- Return accurate bounding boxes that tightly fit each clothing item
+- If a category has no items, return empty array []
+- Return JSON only, no extra text"""
+
+        # ✅ Gemini image analysis with bounding boxes
         ai_response = ai_client.models.generate_content(
-            model='gemini-2.5-flash-lite',
+            model='gemini-2.5-flash',
             contents=[
                 types.Part.from_bytes(
                     data=contents,
@@ -142,10 +277,8 @@ Rules:
             ]
         )
 
-        # Step 4 — Parse Gemini response
+        # Step 3 — Parse response
         raw_text = ai_response.text.strip()
-
-        # Clean markdown if Gemini adds it
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -156,7 +289,7 @@ Rules:
 
         detected_items = json.loads(raw_text)
 
-        # Step 5 — Save each detected item to Supabase wardrobe
+        # Step 4 — Crop each item and save to Supabase
         saved_items = []
         category_map = {
             "tops": "Tops",
@@ -171,32 +304,50 @@ Rules:
                 item_name = item.get("name", "Unknown item")
                 color = item.get("color", "")
                 style = item.get("style", "")
+                bbox = item.get("bbox", None)
 
-                # Full description as item name
-                full_name = f"{item_name}"
+                full_name = item_name
                 if color and color.lower() not in item_name.lower():
                     full_name = f"{color.capitalize()} {item_name}"
 
+                # ✅ Crop using Pillow if bbox available
+                if bbox and len(bbox) == 4:
+                    item_image_bytes = crop_item_from_image(contents, bbox)
+                    image_ext = "png"
+                    content_type = "image/png"
+                else:
+                    item_image_bytes = contents
+                    image_ext = "jpg"
+                    content_type = "image/jpeg"
+
+                # Upload cropped image
+                item_file_path = f"{user_id}/{category_label.lower()}/{uuid.uuid4()}.{image_ext}"
+                supabase.storage.from_("clothing-images").upload(
+                    path=item_file_path,
+                    file=item_image_bytes,
+                    file_options={"content-type": content_type, "x-upsert": "true"}
+                )
+                item_image_url = supabase.storage.from_("clothing-images").get_public_url(item_file_path)
+
+                # Save to DB
                 item_data = {
                     "user_id": user_id,
-                    "image_url": outfit_photo_url,
+                    "image_url": item_image_url,
                     "filename": clean_name,
                     "item_name": full_name,
                     "category": category_label,
                     "style_tag": style,
                 }
-
                 supabase.table("clothing_items").insert(item_data).execute()
                 saved_items.append({
                     "category": category_label,
-                    "item_name": full_name
+                    "item_name": full_name,
+                    "image_url": item_image_url
                 })
 
-        # Step 6 — Return summary
         return {
             "status": "success",
-            "message": f"{len(saved_items)} items detected and saved to your wardrobe!",
-            "outfit_photo_url": outfit_photo_url,
+            "message": f"{len(saved_items)} items detected, cropped and saved!",
             "detected_items": detected_items,
             "saved_items": saved_items
         }
@@ -244,11 +395,11 @@ class OutfitRequest(BaseModel):
     preferences: Optional[dict] = None
 
 
-# ── GENERATE OUTFITS ──────────────────────────────────────────
+# ── GENERATE OUTFITS WITH COLLAGE ─────────────────────────────
 @app.post("/outfits")
 async def generate_outfits(request: OutfitRequest):
     try:
-        # Step 1 — fetch wardrobe from Supabase
+        # Step 1 — fetch wardrobe
         response = supabase.table("clothing_items").select("*").eq("user_id", request.user_id).execute()
 
         if not response.data or len(response.data) == 0:
@@ -257,7 +408,6 @@ async def generate_outfits(request: OutfitRequest):
                 "message": "Wardrobe is empty. Scan some clothes first!"
             }
 
-        # Step 2 — build items list
         items = response.data
         item_descriptions = [
             f"{item.get('item_name') or item.get('filename', 'item')} ({item.get('category', 'General')})"
@@ -269,7 +419,6 @@ async def generate_outfits(request: OutfitRequest):
         }
         wardrobe_str = "\n".join(item_descriptions)
 
-        # Step 3 — build prompt with preferences
         prefs = request.preferences or {}
         styles = prefs.get('styles', [])
         colors = prefs.get('colors', [])
@@ -299,15 +448,13 @@ Use this exact format:
   }}
 ]"""
 
-        # Step 4 — call Gemini
+        # Step 2 — Gemini generates outfit suggestions
         ai_response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.5-flash-lite',
             contents=prompt
         )
 
         raw_text = ai_response.text.strip()
-
-        # Step 5 — clean response
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -317,6 +464,40 @@ Use this exact format:
         raw_text = raw_text.strip()
 
         outfits = json.loads(raw_text)
+
+        # Step 3 — ✅ Build collage for each outfit using Pillow
+        for outfit in outfits:
+            outfit_items = outfit.get("items", [])
+            outfit_name = outfit.get("outfit_name", "Outfit")
+
+            # Get image URLs for items in this outfit
+            item_image_urls = []
+            for item_name in outfit_items:
+                # Fuzzy match item name to wardrobe
+                for wardrobe_key, url in image_map.items():
+                    if any(word.lower() in wardrobe_key.lower() for word in item_name.split()):
+                        if url and url not in item_image_urls:
+                            item_image_urls.append(url)
+                        break
+
+            if item_image_urls:
+                # Build collage using Pillow
+                collage_bytes = await build_outfit_collage(item_image_urls, outfit_name)
+
+                if collage_bytes:
+                    # Upload collage to Supabase
+                    collage_path = f"{request.user_id}/collages/{uuid.uuid4()}.jpg"
+                    supabase.storage.from_("clothing-images").upload(
+                        path=collage_path,
+                        file=collage_bytes,
+                        file_options={"content-type": "image/jpeg", "x-upsert": "true"}
+                    )
+                    collage_url = supabase.storage.from_("clothing-images").get_public_url(collage_path)
+                    outfit["collage_url"] = collage_url  # ✅ attach collage URL to outfit
+                else:
+                    outfit["collage_url"] = None
+            else:
+                outfit["collage_url"] = None
 
         return {"status": "success", "outfits": outfits, "image_map": image_map}
 
